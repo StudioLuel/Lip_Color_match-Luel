@@ -5,4 +5,4 @@ pandas
 matplotlib
 scikit-learn
 opencv-python-headless
-mediapipe
+mediapipe==0.10.14
