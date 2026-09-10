@@ -66,8 +66,6 @@ def analyze_and_mask_lip(image_file):
     main_lab = actual_centers[main_idx]
     dark_lab = actual_centers[dark_idx]
     
-    # 💡 [착색 감지 민감도 극대화] 
-    # 메인 입술과 테두리의 명도(L) 차이가 1.5 이상이거나, 붉은기(a)가 1.5 이상 떨어지면 무조건 착색(투톤)으로 간주
     is_two_tone = (main_lab[0] - dark_lab[0]) > 1.5 or (main_lab[1] - dark_lab[1]) > 1.5
     
     labels_2d = labels.reshape(h, w)
@@ -138,7 +136,6 @@ def analyze_lip_tone(lab):
     
     return lightness, hue
 
-# 💡 [중화 조건 극강화] 티끌 하나 없는 완벽한 입술 외에는 모두 중화 프로세스 진행
 def get_neutralizer_guide(main_lab, dark_lab, is_two_tone):
     target_lab = dark_lab if is_two_tone else main_lab
     l, a, b = target_lab
@@ -201,7 +198,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("💋 PMU Lip Color Match Pro (초정밀 착색 분석)")
+st.title("💋 PMU Lip Color Match Pro")
 st.markdown("그림자를 배제하고 테두리의 미세한 착색까지 잡아내어 필수 중화 영역을 시각화합니다.")
 
 col1, col2 = st.columns(2)
@@ -295,13 +292,16 @@ if current_file and target_file:
         """
         st.markdown(html_table, unsafe_allow_html=True)
 
-    st.markdown('<div class="step-header">✨ 분석 5&6. 메인 컬러 주입 타겟 및 예상 결과 시각화</div>', unsafe_allow_html=True)
-    c1, c2 = st.columns(2)
+    # 💡 3분할 화면으로 원본, 주입 타겟, 예상 결과를 나란히 배치
+    st.markdown('<div class="step-header">✨ 분석 5&6. 초기 상태 ➔ 주입 타겟 ➔ 예상 결과 시뮬레이션</div>', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    
+    c1.image(base_img, caption="[원본] 처리 전 초기 입술", use_container_width=True)
     
     target_area_img = apply_color_overlay(base_img, full_lip_mask, mix_hex, alpha=0.9)
-    c1.image(target_area_img, caption="[분석 5] 메인 컬러 주입 타겟 부위", use_container_width=True)
+    c2.image(target_area_img, caption="[타겟] 메인 컬러 주입 부위", use_container_width=True)
     
     final_result_img = apply_color_overlay(base_img, full_lip_mask, mix_hex, alpha=0.45)
-    c2.image(final_result_img, caption="[분석 6] 시술 직후 예상 맵핑 결과물", use_container_width=True)
+    c3.image(final_result_img, caption="[예상] 시술 후 예상 결과", use_container_width=True)
     
     st.caption("※ 시각화된 예상 이미지는 픽셀 블렌딩을 통한 시뮬레이션이며, 실제 고객의 피부 조직 두께 및 탈각 과정에 따라 최종 발색은 다를 수 있습니다.")
