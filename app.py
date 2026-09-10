@@ -22,36 +22,58 @@ PIGMENT_DB = {
     }
 }
 
-# 2. 이미지 마스킹 및 분석 기능 (업그레이드)
+# 2. [핵심 보완] 음영/그림자 무시 기반 정밀 입술 추출 알고리즘
 @st.cache_data
 def analyze_and_mask_lip(image_file):
-    # 연산 속도와 안정성을 위해 해상도 최적화
     image = Image.open(image_file).convert('RGB')
     image.thumbnail((400, 400))
     img_array = np.array(image)
     h, w, _ = img_array.shape
     
     img_lab = color.rgb2lab(img_array)
-    pixels = img_lab.reshape(-1, 3)
     
-    # 4개의 그룹으로 나누어 분석 (피부, 그림자, 입술 메인, 입술 테두리)
+    # 💡 [그림자 무시 로직]
+    # L*(명도)의 가중치를 대폭 줄이고, a*(붉은기)의 가중치를 증폭시켜 실제 색소 차이만 분석합니다.
+    features = img_lab.copy()
+    features[:, :, 0] = features[:, :, 0] * 0.2  # 명도(그림자) 영향력 80% 감소
+    features[:, :, 1] = features[:, :, 1] * 1.5  # 붉은색 계열 영향력 150% 증폭
+    features[:, :, 2] = features[:, :, 2] * 1.2  # 노란/푸른색 계열 영향력 120% 증폭
+    
+    pixels_features = features.reshape(-1, 3)
+    pixels_original = img_lab.reshape(-1, 3)
+    
+    # 특징(가중치) 기반 군집화
     kmeans = KMeans(n_clusters=4, random_state=42, n_init=5)
-    labels = kmeans.fit_predict(pixels)
-    centers = kmeans.cluster_centers_
+    labels = kmeans.fit_predict(pixels_features)
     
-    # a* 값(붉은기)이 가장 높은 2개의 그룹을 입술 영역으로 추출
-    sorted_by_a_idx = np.argsort(centers[:, 1])[::-1]
+    # 가중치가 적용되지 않은 원본 LAB 공간에서 각 군집의 실제 평균 색상 복원
+    actual_centers = []
+    for i in range(4):
+        cluster_pixels = pixels_original[labels == i]
+        if len(cluster_pixels) > 0:
+            actual_centers.append(np.mean(cluster_pixels, axis=0))
+        else:
+            actual_centers.append(np.array([0, 0, 0]))
+    actual_centers = np.array(actual_centers)
+    
+    # 붉은기(a*)가 가장 높은 2개의 그룹을 입술 영역으로 추출
+    sorted_by_a_idx = np.argsort(actual_centers[:, 1])[::-1]
     lip_idx_1, lip_idx_2 = sorted_by_a_idx[0], sorted_by_a_idx[1]
     
-    # 명도(L*)를 비교하여 밝은 쪽을 메인, 어두운 쪽을 테두리(착색)로 분류
-    if centers[lip_idx_1][0] > centers[lip_idx_2][0]:
+    # 착색(Dark)은 단순히 명도가 낮은 것이 아니라 붉은기(a*)도 함께 낮아지는 특성을 고려하여 구분
+    score_1 = actual_centers[lip_idx_1][0] + actual_centers[lip_idx_1][1]
+    score_2 = actual_centers[lip_idx_2][0] + actual_centers[lip_idx_2][1]
+    
+    if score_1 > score_2:
         main_idx, dark_idx = lip_idx_1, lip_idx_2
     else:
         main_idx, dark_idx = lip_idx_2, lip_idx_1
         
-    main_lab = centers[main_idx]
-    dark_lab = centers[dark_idx]
-    is_two_tone = (main_lab[0] - dark_lab[0]) > 5.0
+    main_lab = actual_centers[main_idx]
+    dark_lab = actual_centers[dark_idx]
+    
+    # 투톤(착색) 판별 조건 강화: 명도뿐만 아니라 색상(a*) 차이도 함께 존재해야 착색으로 인정 (단순 그림자 배제)
+    is_two_tone = (main_lab[0] - dark_lab[0]) > 4.0 and (main_lab[1] - dark_lab[1]) > 2.0
     
     # 마스크(영역) 생성
     labels_2d = labels.reshape(h, w)
@@ -59,7 +81,7 @@ def analyze_and_mask_lip(image_file):
     dark_mask = (labels_2d == dark_idx)
     full_lip_mask = main_mask | dark_mask
     
-    return img_array, main_mask, dark_mask, full_lip_mask, np.array(main_lab), np.array(dark_lab), is_two_tone
+    return img_array, main_mask, dark_mask, full_lip_mask, main_lab, dark_lab, is_two_tone
 
 @st.cache_data
 def get_single_dominant_lab(image_file):
@@ -67,12 +89,29 @@ def get_single_dominant_lab(image_file):
     image.thumbnail((150, 150))
     img_array = np.array(image)
     img_lab = color.rgb2lab(img_array)
-    pixels = img_lab.reshape(-1, 3)
+    
+    # 목표 색상 추출 시에도 그림자 무시 로직 동일 적용
+    features = img_lab.copy()
+    features[:, :, 0] = features[:, :, 0] * 0.2
+    features[:, :, 1] = features[:, :, 1] * 1.5
+    features[:, :, 2] = features[:, :, 2] * 1.2
+    
+    pixels_features = features.reshape(-1, 3)
+    pixels_original = img_lab.reshape(-1, 3)
     
     kmeans = KMeans(n_clusters=3, random_state=42, n_init=5)
-    kmeans.fit(pixels)
-    centers = kmeans.cluster_centers_
-    lip_cluster = max(centers, key=lambda c: c[1])
+    labels = kmeans.fit_predict(pixels_features)
+    
+    actual_centers = []
+    for i in range(3):
+        cluster_pixels = pixels_original[labels == i]
+        if len(cluster_pixels) > 0:
+            actual_centers.append(np.mean(cluster_pixels, axis=0))
+        else:
+            actual_centers.append(np.array([0, 0, 0]))
+    actual_centers = np.array(actual_centers)
+    
+    lip_cluster = max(actual_centers, key=lambda c: c[1])
     return np.array(lip_cluster)
 
 # 오버레이 시각화 생성 함수
@@ -85,10 +124,9 @@ def apply_color_overlay(base_img, mask, hex_color, alpha=0.6):
         overlay[mask, c] = (base_img[mask, c] * (1 - alpha) + color_uint8[c] * alpha).astype(np.uint8)
     return overlay
 
-# 영역 분포도 시각화 (분석 1)
+# 영역 분포도 시각화
 def generate_distribution_map(base_img, main_mask, dark_mask):
     overlay = base_img.copy()
-    # 밝은 메인 영역은 핑크(#ff9ff3), 어두운 착색 영역은 블루(#54a0ff)로 맵핑
     c_main = np.array(mcolors.to_rgb('#ff9ff3')) * 255
     c_dark = np.array(mcolors.to_rgb('#54a0ff')) * 255
     
@@ -173,7 +211,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("💋 PMU Lip Color Match Pro (시각화 분석)")
-st.markdown("입술 영역을 스캔하여 중화 및 시술 부위를 시각적 맵핑으로 제공합니다.")
+st.markdown("입술 영역을 스캔하여 그림자를 배제한 실제 착색 부위를 시각적 맵핑으로 제공합니다.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -186,7 +224,7 @@ with col2:
 if current_file and target_file:
     st.divider()
     
-    with st.spinner('AI가 입술의 영역을 추출하고 시각화 지도를 생성 중입니다...'):
+    with st.spinner('AI가 그림자를 제거하고 실제 입술의 착색 영역 지도를 생성 중입니다...'):
         base_img, main_mask, dark_mask, full_lip_mask, curr_main_lab, curr_dark_lab, is_two_tone = analyze_and_mask_lip(current_file)
         targ_lab = get_single_dominant_lab(target_file)
         
@@ -197,7 +235,6 @@ if current_file and target_file:
         neutralizer = get_neutralizer_guide(curr_main_lab, curr_dark_lab, is_two_tone)
         best_mix = find_best_mix(targ_lab)
         
-        # 혼합 결과 HEX 코드
         mix_hex = targ_hex
         if best_mix["p2"] is not None:
             mix_rgb = color.lab2rgb(np.array([[best_mix["mixed_lab"]]]))[0][0]
@@ -206,21 +243,21 @@ if current_file and target_file:
     # ----------------------------------------
     # 분석 1: 입술 색상 분포도 시각화
     # ----------------------------------------
-    st.markdown('<div class="step-header">🔍 분석 1. 시술 전 색상 분포도 (입술 영역 스캔)</div>', unsafe_allow_html=True)
+    st.markdown('<div class="step-header">🔍 분석 1. 시술 전 색상 분포도 (그림자 무시 맵핑)</div>', unsafe_allow_html=True)
     c1, c2 = st.columns([1.2, 1])
     
     dist_img = generate_distribution_map(base_img, main_mask, dark_mask)
-    c1.image(dist_img, caption="분홍색: 메인 밝은 톤 / 파란색: 테두리 착색 톤", use_container_width=True)
+    c1.image(dist_img, caption="분홍색: 메인 밝은 톤 / 파란색: 테두리 실제 착색 톤", use_container_width=True)
     
     c2.markdown(f"""
     <div class="extract-box">
         <strong>✨ 메인 톤:</strong> {get_color_box_by_hex(main_hex, 20)}<br>
-        <strong>🌑 다크 톤:</strong> {get_color_box_by_hex(dark_hex, 20)}
+        <strong>🌑 실제 착색 톤:</strong> {get_color_box_by_hex(dark_hex, 20)}
     </div>
     """, unsafe_allow_html=True)
     
     if is_two_tone:
-        c2.error("🚨 짙은 테두리(투톤) 감지됨")
+        c2.error("🚨 테두리 실제 착색(투톤) 감지됨")
     
     # ----------------------------------------
     # 분석 2: 중화 색상 주입 부위 시각화
@@ -229,7 +266,6 @@ if current_file and target_file:
     c1, c2 = st.columns([1.2, 1])
     
     if neutralizer["needed"]:
-        # 투톤이면 테두리(dark_mask)에만, 아니면 전체(full_lip_mask)에 중화색 시각화
         target_mask = dark_mask if is_two_tone else full_lip_mask
         neu_img = apply_color_overlay(base_img, target_mask, neutralizer["hex"], alpha=0.7)
         c1.image(neu_img, caption="컬러 주입 타겟 부위", use_container_width=True)
@@ -242,7 +278,7 @@ if current_file and target_file:
         c2.success("✨ 베이스가 양호하여 중화 단계 생략")
 
     # ----------------------------------------
-    # 분석 3 & 4: 배합비 산출 (기존 로직 유지)
+    # 분석 3 & 4: 배합비 산출
     # ----------------------------------------
     st.markdown('<div class="step-header">🎨 분석 3&4. 본 컬러 배합 가이드</div>', unsafe_allow_html=True)
     p1, p2 = best_mix["p1"], best_mix["p2"]
@@ -281,11 +317,9 @@ if current_file and target_file:
     st.markdown('<div class="step-header">✨ 분석 5&6. 메인 컬러 주입 타겟 및 예상 결과 시각화</div>', unsafe_allow_html=True)
     c1, c2 = st.columns(2)
     
-    # 분석 5: 본 컬러를 주입해야 하는 전체 입술 영역 시각화
     target_area_img = apply_color_overlay(base_img, full_lip_mask, mix_hex, alpha=0.9)
     c1.image(target_area_img, caption="[분석 5] 메인 컬러 주입 타겟 부위", use_container_width=True)
     
-    # 분석 6: 시술 후 피부톤과 어우러진 자연스러운 예상 결과물 시각화
     final_result_img = apply_color_overlay(base_img, full_lip_mask, mix_hex, alpha=0.45)
     c2.image(final_result_img, caption="[분석 6] 시술 직후 예상 맵핑 결과물", use_container_width=True)
     
