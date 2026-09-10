@@ -6,6 +6,7 @@ import itertools
 import pandas as pd
 import re
 import matplotlib.colors as mcolors
+from sklearn.cluster import KMeans
 
 # 1. 가상 색소 데이터베이스 (Perma Blend 전용)
 PIGMENT_DB = {
@@ -21,12 +22,27 @@ PIGMENT_DB = {
     }
 }
 
-# 2. 이미지에서 LAB 색상 추출 함수
-def get_average_lab(image_file):
+# 2. [업그레이드] K-Means 알고리즘으로 입술 색상만 정밀 추출하는 함수
+@st.cache_data
+def get_dominant_lab(image_file):
+    # 이미지 로드 및 리사이즈 (연산 속도 향상 및 노이즈 제거)
     image = Image.open(image_file).convert('RGB')
+    image.thumbnail((150, 150))
     img_array = np.array(image)
+    
+    # LAB 변환 및 1차원 배열로 펼치기
     img_lab = color.rgb2lab(img_array)
-    return np.array([np.mean(img_lab[:, :, 0]), np.mean(img_lab[:, :, 1]), np.mean(img_lab[:, :, 2])])
+    pixels = img_lab.reshape(-1, 3)
+    
+    # K-Means 군집화 (사진을 3개의 주요 색상 그룹으로 분리)
+    kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+    kmeans.fit(pixels)
+    centers = kmeans.cluster_centers_
+    
+    # 3개의 색상 그룹 중 a* 값(붉은기/Magenta)이 가장 높은 그룹을 입술 색상으로 판별
+    lip_cluster = max(centers, key=lambda c: c[1])
+    
+    return np.array(lip_cluster)
 
 # 3. LAB 기반 현재 입술 톤 진단 함수
 def analyze_lip_tone(lab):
@@ -51,7 +67,7 @@ def get_neutralizer_guide(lab):
             "name": "브라이트 오렌지 코렉터 (예: Orange Crush 단독)",
             "hex": "#FF7F00",
             "desc": "명도를 높이고 푸른기를 강하게 잡아야 하는 입술입니다.",
-            "guide": "어둡고 푸른 기가 도는 부위(주로 입술 테두리나 얼룩진 곳)에 오렌지 코렉터를 가볍게 터치합니다. 색소를 너무 깊게 찌르지 않고 얇은 픽셀 기법으로 깔아주어 베이스를 웜톤으로 끌어올리세요."
+            "guide": "어둡고 푸른 기가 도는 부위(주로 입술 테두리나 얼룩진 곳)에 오렌지 코렉터를 가볍게 터치합니다. 얇은 픽셀 기법으로 깔아주어 베이스를 웜톤으로 끌어올리세요."
         }
     elif b < 8:
         return {
@@ -77,7 +93,7 @@ def get_neutralizer_guide(lab):
             "guide": "현재 입술 베이스가 양호하여 사전 중화 작업 없이 즉시 본 컬러 시술이 가능합니다."
         }
 
-# 5. 컬러 박스(도시화) HTML 생성 함수
+# 5. 컬러 박스 HTML 생성 함수
 def get_color_box(name, size=25):
     match = re.search(r'#([A-Fa-f0-9]{6})', name)
     hex_code = f"#{match.group(1)}" if match else "#CCCCCC"
@@ -85,6 +101,13 @@ def get_color_box(name, size=25):
 
 def get_color_box_by_hex(hex_code, size=25):
     return f'<div style="background-color: {hex_code}; width: {size}px; height: {size}px; border-radius: 4px; border: 1px solid #ccc; display: inline-block; vertical-align: middle;"></div>'
+
+def lab_to_hex(lab_array):
+    try:
+        rgb = color.lab2rgb(np.array([[lab_array]]))[0][0]
+        return mcolors.to_hex(rgb)
+    except:
+        return "#CCCCCC"
 
 # 6. 최적 배합비 산출 알고리즘
 def find_best_mix(target_lab):
@@ -111,7 +134,7 @@ def find_best_mix(target_lab):
 # ----------------- UI 구성 -----------------
 st.set_page_config(page_title="PMU 컬러 매치 프로", page_icon="💋", layout="centered")
 st.title("💋 PMU Lip Color Match Pro (Perma Blend)")
-st.markdown("입술 톤 진단부터 사전 중화, 퍼마블렌드 전용 색소 배합까지 안내하는 전문가용 가이드입니다.")
+st.markdown("AI가 피부와 치아를 제외한 입술 본연의 색상만 정밀 추출하여 분석합니다.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -124,14 +147,17 @@ with col2:
 if current_file and target_file:
     st.divider()
     
-    curr_lab = get_average_lab(current_file)
-    targ_lab = get_average_lab(target_file)
+    with st.spinner('AI가 사진에서 입술 영역만 정밀 분리하여 색상을 추출하고 있습니다...'):
+        curr_lab = get_dominant_lab(current_file)
+        targ_lab = get_dominant_lab(target_file)
+    
     lightness, hue = analyze_lip_tone(curr_lab)
     
     st.markdown("""
         <style>
         .step-header { background-color: #f0f2f6; padding: 10px; border-radius: 5px; margin-top: 20px; margin-bottom: 10px; font-weight: bold; }
         .neutralize-box { background-color: #fff9e6; border-left: 4px solid #f39c12; padding: 15px; border-radius: 5px; margin-bottom: 15px;}
+        .extract-box { display: inline-block; padding: 5px 10px; background-color: #f8f9fa; border: 1px solid #ddd; border-radius: 5px; margin-bottom: 10px; font-size: 0.9em; }
         </style>
     """, unsafe_allow_html=True)
     
@@ -139,6 +165,10 @@ if current_file and target_file:
     st.markdown('<div class="step-header">🔍 분석 1. 현재 입술 기본 톤 진단</div>', unsafe_allow_html=True)
     c1, c2 = st.columns([1, 2])
     c1.image(current_file, use_container_width=True)
+    
+    # 추출된 실제 입술 색상 보여주기
+    extracted_hex = lab_to_hex(curr_lab)
+    c2.markdown(f'<div class="extract-box">🤖 AI 추출 입술 컬러: {get_color_box_by_hex(extracted_hex, 20)}</div>', unsafe_allow_html=True)
     c2.markdown(f"**명도 상태:** {lightness}")
     c2.markdown(f"**색상 계열:** {hue}")
     c2.caption(f"*세부 수치(LAB): L({curr_lab[0]:.1f}) / a({curr_lab[1]:.1f}) / b({curr_lab[2]:.1f})*")
@@ -165,8 +195,11 @@ if current_file and target_file:
 
     # 프로세스 3: 목표와 현재 색상 대조 및 방향성
     st.markdown('<div class="step-header">⚖️ 분석 3. 본 컬러 방향성 설정</div>', unsafe_allow_html=True)
-    diff_L = targ_lab[0] - curr_lab[0]
     
+    targ_hex = lab_to_hex(targ_lab)
+    st.markdown(f"**목표 추출 컬러:** {get_color_box_by_hex(targ_hex, 20)}", unsafe_allow_html=True)
+    
+    diff_L = targ_lab[0] - curr_lab[0]
     direction_msg = []
     if diff_L > 3: direction_msg.append("현재보다 **톤업(밝게)** 표현 필요")
     elif diff_L < -3: direction_msg.append("현재보다 **딥하게(어둡게)** 표현 필요")
@@ -212,10 +245,8 @@ if current_file and target_file:
         """
         st.markdown(html_table, unsafe_allow_html=True)
         
-        from skimage.color import lab2rgb
-        
         try:
-            mix_rgb = lab2rgb(np.array([[result["mixed_lab"]]]))[0][0]
+            mix_rgb = color.lab2rgb(np.array([[result["mixed_lab"]]]))[0][0]
             mix_hex = mcolors.to_hex(mix_rgb)
             st.write("")
             st.markdown(f"""
