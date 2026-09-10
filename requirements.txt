@@ -1,8 +1,8 @@
 streamlit
 numpy
-opencv-python-headless
 scikit-image
-Pillow
 pandas
 matplotlib
 scikit-learn
+opencv-python-headless
+mediapipe
