@@ -22,7 +22,7 @@ PIGMENT_DB = {
     }
 }
 
-# 2. 음영 무시 및 초정밀 착색 감지 알고리즘
+# 2. 초정밀 착색 감지 (그림자 완벽 배제)
 @st.cache_data
 def analyze_and_mask_lip(image_file):
     image = Image.open(image_file).convert('RGB')
@@ -32,10 +32,11 @@ def analyze_and_mask_lip(image_file):
     
     img_lab = color.rgb2lab(img_array)
     
+    # 💡 [그림자 완벽 배제 로직] 명도(L)의 비중을 10%로 대폭 낮추고, 붉은기(a)의 비중을 200%로 증폭
     features = img_lab.copy()
-    features[:, :, 0] = features[:, :, 0] * 0.2  # 그림자 영향 최소화
-    features[:, :, 1] = features[:, :, 1] * 1.5
-    features[:, :, 2] = features[:, :, 2] * 1.2
+    features[:, :, 0] = features[:, :, 0] * 0.1  
+    features[:, :, 1] = features[:, :, 1] * 2.0  
+    features[:, :, 2] = features[:, :, 2] * 1.5
     
     pixels_features = features.reshape(-1, 3)
     pixels_original = img_lab.reshape(-1, 3)
@@ -66,7 +67,8 @@ def analyze_and_mask_lip(image_file):
     main_lab = actual_centers[main_idx]
     dark_lab = actual_centers[dark_idx]
     
-    is_two_tone = (main_lab[0] - dark_lab[0]) > 1.5 or (main_lab[1] - dark_lab[1]) > 1.5
+    # 💡 [진짜 착색 판별] 명도가 아닌 "붉은기(a*)의 눈에 띄는 소실(1.8 이상 하락)"만을 착색으로 판단
+    is_two_tone = (main_lab[1] - dark_lab[1]) > 1.8
     
     labels_2d = labels.reshape(h, w)
     main_mask = (labels_2d == main_idx)
@@ -83,9 +85,9 @@ def get_single_dominant_lab(image_file):
     img_lab = color.rgb2lab(img_array)
     
     features = img_lab.copy()
-    features[:, :, 0] = features[:, :, 0] * 0.2
-    features[:, :, 1] = features[:, :, 1] * 1.5
-    features[:, :, 2] = features[:, :, 2] * 1.2
+    features[:, :, 0] = features[:, :, 0] * 0.1
+    features[:, :, 1] = features[:, :, 1] * 2.0
+    features[:, :, 2] = features[:, :, 2] * 1.5
     
     pixels_features = features.reshape(-1, 3)
     pixels_original = img_lab.reshape(-1, 3)
@@ -124,33 +126,67 @@ def generate_distribution_map(base_img, main_mask, dark_mask):
         overlay[dark_mask, c] = (base_img[dark_mask, c] * 0.4 + c_dark[c] * 0.6).astype(np.uint8)
     return overlay
 
-def analyze_lip_tone(lab):
-    l, a, b = lab
-    if l < 43: lightness = "어두운 톤"
-    elif l > 60: lightness = "밝은 톤"
-    else: lightness = "중간 밝기 톤"
+# 💡 [분석 1] 상세 진단 및 이유 반환
+def analyze_lip_tone_detailed(main_lab, dark_lab, is_two_tone):
+    l, a, b = main_lab
     
-    if b < 5: hue = "쿨톤 (푸른기/보랏빛)"
-    elif b > 18: hue = "웜톤 (오렌지/노란기)"
-    else: hue = "뉴트럴톤 (자연스러운 붉은기)"
-    
-    return lightness, hue
+    if l < 43:
+        lightness, l_reason = "어두운 톤", f"명도(L*)가 {l:.1f}로 낮아 전체적으로 어둡습니다."
+    elif l > 60:
+        lightness, l_reason = "밝은 톤", f"명도(L*)가 {l:.1f}로 높아 색소 발색이 유리합니다."
+    else:
+        lightness, l_reason = "중간 밝기 톤", f"명도(L*)가 {l:.1f}로 평균적인 밝기입니다."
+        
+    if b < 5:
+        hue, h_reason = "쿨톤 (푸른기/보랏빛)", f"노란/푸른기(b*)가 {b:.1f}로 낮아 차가운 온도를 띱니다."
+    elif b > 18:
+        hue, h_reason = "웜톤 (오렌지/노란기)", f"노란/푸른기(b*)가 {b:.1f}로 높아 따뜻한 온도를 띱니다."
+    else:
+        hue, h_reason = "뉴트럴톤 (자연스러움)", f"노란/푸른기(b*)가 {b:.1f}로 중립적입니다."
+        
+    if is_two_tone:
+        uni, u_reason = "투톤 (테두리 착색)", f"테두리의 붉은기(a*)가 메인보다 {main_lab[1]-dark_lab[1]:.1f} 소실되어 진짜 착색으로 판별됨."
+    else:
+        uni, u_reason = "균일한 톤", "부위별 붉은기(a*) 편차가 적어 그림자를 제외하면 균일한 상태임."
+        
+    return lightness, l_reason, hue, h_reason, uni, u_reason
 
-def get_neutralizer_guide(main_lab, dark_lab, is_two_tone):
+# 💡 [분석 2] 중화 진단 및 이유/추천근거 반환
+def get_neutralizer_guide_detailed(main_lab, dark_lab, is_two_tone):
     target_lab = dark_lab if is_two_tone else main_lab
     l, a, b = target_lab
     
     if is_two_tone:
         if l < 45 or b < 8:
-            return {"needed": True, "type": "투톤 / 짙은 테두리 착색", "name": "브라이트 오렌지", "hex": "#FF7F00", "desc": "명도가 낮고 짙은 착색 부위 강력한 톤업 필요"}
+            return {
+                "needed": True, "type": "투톤 / 짙은 테두리 착색", "name": "브라이트 오렌지", "hex": "#FF7F00",
+                "diag_reason": "테두리의 붉은기가 크게 소실되었고, 명도가 낮거나 푸른기가 강합니다.",
+                "col_reason": "강한 푸른기와 어두움을 보색(반대색) 원리로 상쇄하려면 고채도의 오렌지가 필수입니다.",
+                "guide": "파란색 표시 영역에 타겟팅하여 주입하세요."
+            }
         else:
-            return {"needed": True, "type": "투톤 / 옅은 테두리 착색", "name": "살몬 / 코랄", "hex": "#FF8C69", "desc": "미세한 착색 및 톤 불균형 교정 필요"}
+            return {
+                "needed": True, "type": "투톤 / 옅은 테두리 착색", "name": "살몬 / 코랄", "hex": "#FF8C69",
+                "diag_reason": "테두리 붉은기가 미세하게 소실되어 약간의 탁함이 존재합니다.",
+                "col_reason": "과도한 중화보다는 자연스러운 혈색 보완을 위해 부드러운 살몬/코랄이 적합합니다.",
+                "guide": "파란색 표시 영역에 가볍게 터치하세요."
+            }
     elif l < 48 and b < 10:
-        return {"needed": True, "type": "전체 다크 / 보랏빛", "name": "브라이트 오렌지", "hex": "#FF7F00", "desc": "전체 명도 증가 및 웜톤화"}
+        return {
+            "needed": True, "type": "전체 다크 / 보랏빛", "name": "브라이트 오렌지", "hex": "#FF7F00",
+            "diag_reason": "전체적으로 명도가 낮고 차가운 보랏빛을 띠고 있습니다.",
+            "col_reason": "어두운 쿨톤 베이스를 웜톤으로 강력히 끌어올리기 위해 오렌지 코렉터가 필요합니다.",
+            "guide": "전체 영역에 얇게 깔아주세요."
+        }
     elif b < 8:
-        return {"needed": True, "type": "창백 / 푸른빛", "name": "살몬 / 코랄", "hex": "#FF8C69", "desc": "온도감 상승 필요"}
+        return {
+            "needed": True, "type": "창백 / 푸른빛", "name": "살몬 / 코랄", "hex": "#FF8C69",
+            "diag_reason": "명도는 양호하나 전체적으로 혈색이 없는 차가운 톤입니다.",
+            "col_reason": "입술의 시각적 온도를 자연스럽게 높여주기 위해 웜톤의 코랄 계열을 사용합니다.",
+            "guide": "전체 영역에 가볍게 깔아주세요."
+        }
     else:
-        return {"needed": False, "type": "완벽한 균일 톤", "name": "-", "hex": None, "desc": "미세 착색도 없는 완벽한 베이스로 중화 전면 생략"}
+        return {"needed": False, "type": "완벽한 균일 톤", "name": "-", "hex": None, "diag_reason": "붉은기 소실이나 푸른기 등 착색 징후가 전혀 발견되지 않았습니다.", "col_reason": "-", "guide": "사전 중화 전면 생략"}
 
 def get_color_box_by_hex(hex_code, size=25):
     return f'<div style="background-color: {hex_code}; width: {size}px; height: {size}px; border-radius: 4px; border: 1px solid #999; display: inline-block; vertical-align: middle;"></div>'
@@ -195,11 +231,14 @@ st.markdown("""
     <style>
     .step-header { background-color: #e2e8f0; color: #111111 !important; padding: 10px; border-radius: 5px; margin-top: 20px; margin-bottom: 10px; font-weight: bold; }
     .extract-box { padding: 12px; background-color: #f8f9fa; color: #111111 !important; border: 1px solid #ccc; border-radius: 5px; margin-bottom: 10px; font-size: 0.95em; }
+    .reason-text { font-size: 0.85em; color: #555555; margin-top: 2px; margin-bottom: 10px; padding-left: 10px; border-left: 2px solid #ddd; }
+    .legend-box { display: flex; gap: 15px; margin-bottom: 10px; font-size: 0.9em; align-items: center; justify-content: center; background-color: #f1f2f6; padding: 8px; border-radius: 5px; }
+    .legend-color { width: 16px; height: 16px; border-radius: 3px; display: inline-block; vertical-align: middle; margin-right: 5px; border: 1px solid #999; }
     </style>
 """, unsafe_allow_html=True)
 
 st.title("💋 PMU Lip Color Match Pro")
-st.markdown("그림자를 배제하고 테두리의 미세한 착색까지 잡아내어 필수 중화 영역을 시각화합니다.")
+st.markdown("그림자를 배제하고 붉은기 소실만을 추적하여 세밀한 분포도와 진단 근거를 제공합니다.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -212,7 +251,7 @@ with col2:
 if current_file and target_file:
     st.divider()
     
-    with st.spinner('미세 착색 영역을 분석 중입니다...'):
+    with st.spinner('그림자 배제 및 정밀 색상 분포를 계산 중입니다...'):
         base_img, main_mask, dark_mask, full_lip_mask, curr_main_lab, curr_dark_lab, is_two_tone = analyze_and_mask_lip(current_file)
         targ_lab = get_single_dominant_lab(target_file)
         
@@ -220,57 +259,75 @@ if current_file and target_file:
         dark_hex = lab_to_hex(curr_dark_lab)
         targ_hex = lab_to_hex(targ_lab)
         
-        neutralizer = get_neutralizer_guide(curr_main_lab, curr_dark_lab, is_two_tone)
-        best_mix = find_best_mix(targ_lab)
+        # 상세 진단 결과 호출
+        lightness, l_reason, hue, h_reason, uni, u_reason = analyze_lip_tone_detailed(curr_main_lab, curr_dark_lab, is_two_tone)
+        neutralizer = get_neutralizer_guide_detailed(curr_main_lab, curr_dark_lab, is_two_tone)
         
+        best_mix = find_best_mix(targ_lab)
         mix_hex = targ_hex
         if best_mix["p2"] is not None:
             mix_rgb = color.lab2rgb(np.array([[best_mix["mixed_lab"]]]))[0][0]
             mix_hex = mcolors.to_hex(mix_rgb)
 
+    # ----------------------------------------
+    # 🔍 분석 1: 입술 색상 분포도 시각화
+    # ----------------------------------------
     st.markdown('<div class="step-header">🔍 분석 1. 시술 전 색상 분포도 (그림자 무시 맵핑)</div>', unsafe_allow_html=True)
-    c1, c2 = st.columns([1.2, 1])
     
-    dist_img = generate_distribution_map(base_img, main_mask, dark_mask)
-    c1.image(dist_img, caption="분홍색: 메인 밝은 톤 / 파란색: 미세 착색 감지 부위", use_container_width=True)
-    
-    c2.markdown(f"""
-    <div class="extract-box">
-        <strong>✨ 메인 톤:</strong> {get_color_box_by_hex(main_hex, 20)}<br>
-        <strong>🌑 착색 감지 톤:</strong> {get_color_box_by_hex(dark_hex, 20)}
+    # 범례 추가
+    st.markdown("""
+    <div class="legend-box">
+        <div><span class="legend-color" style="background-color: #ff9ff3;"></span><strong>정상 발색 영역 (메인 톤)</strong></div>
+        <div><span class="legend-color" style="background-color: #54a0ff;"></span><strong>붉은기 소실/착색 영역 (다크 톤)</strong></div>
     </div>
     """, unsafe_allow_html=True)
     
-    if is_two_tone:
-        c2.error("🚨 테두리 또는 일부 미세 착색 감지됨")
-    else:
-        c2.success("✨ 매우 균일한 톤 감지됨")
+    c1, c2 = st.columns([1.2, 1])
+    dist_img = generate_distribution_map(base_img, main_mask, dark_mask)
+    c1.image(dist_img, caption="AI 맵핑 분포도", use_container_width=True)
     
-    st.markdown('<div class="step-header">🛠️ 분석 2. 사전 중화(Neutralizer) 주입 타겟 시각화</div>', unsafe_allow_html=True)
+    c2.markdown(f"**명도 상태:** {lightness}")
+    c2.markdown(f"<div class='reason-text'>↳ {l_reason}</div>", unsafe_allow_html=True)
+    
+    c2.markdown(f"**온도/색상:** {hue}")
+    c2.markdown(f"<div class='reason-text'>↳ {h_reason}</div>", unsafe_allow_html=True)
+    
+    c2.markdown(f"**균일도:** <span style='color:#e74c3c; font-weight:bold;'>{uni}</span>", unsafe_allow_html=True)
+    c2.markdown(f"<div class='reason-text'>↳ {u_reason}</div>", unsafe_allow_html=True)
+    
+    # ----------------------------------------
+    # 🛠️ 분석 2: 사전 중화 시각화 및 이유
+    # ----------------------------------------
+    st.markdown('<div class="step-header">🛠️ 분석 2. 사전 중화(Neutralizer) 진단 및 타겟 시각화</div>', unsafe_allow_html=True)
     c1, c2 = st.columns([1.2, 1])
     
     if neutralizer["needed"]:
         target_mask = dark_mask if is_two_tone else full_lip_mask
         neu_img = apply_color_overlay(base_img, target_mask, neutralizer["hex"], alpha=0.7)
-        c1.image(neu_img, caption="컬러 주입 타겟 부위", use_container_width=True)
+        c1.image(neu_img, caption="중화 컬러 주입 타겟 부위", use_container_width=True)
         
         c2.warning(f"**진단 타입:** {neutralizer['type']}")
+        c2.markdown(f"<div class='reason-text'><strong>[진단 이유]</strong> {neutralizer['diag_reason']}</div>", unsafe_allow_html=True)
+        
         c2.markdown(f"**추천 컬러:** {get_color_box_by_hex(neutralizer['hex'], 20)} {neutralizer['name']}", unsafe_allow_html=True)
-        c2.info(f"**시술 가이드:** 사진에 파란색으로 표시되었던 착색 부위(색칠 영역)에만 중화제를 적용하여 톤을 균일하게 맞추세요.")
+        c2.markdown(f"<div class='reason-text'><strong>[추천 근거]</strong> {neutralizer['col_reason']}</div>", unsafe_allow_html=True)
+        
+        c2.info(f"**시술 가이드:** {neutralizer['guide']}")
     else:
         c1.image(base_img, caption="중화 불필요", use_container_width=True)
-        c2.success(f"✨ {neutralizer['desc']}")
+        c2.success(f"✨ {neutralizer['type']}")
+        c2.markdown(f"<div class='reason-text'><strong>[진단 이유]</strong> {neutralizer['diag_reason']}</div>", unsafe_allow_html=True)
 
+    # ----------------------------------------
+    # 🎨 분석 3&4: 본 컬러 배합
+    # ----------------------------------------
     st.markdown('<div class="step-header">🎨 분석 3&4. 본 컬러 배합 가이드</div>', unsafe_allow_html=True)
     p1, p2 = best_mix["p1"], best_mix["p2"]
     
     if p2 is None:
         st.success(f"단일 색상: {p1['mfg']} - {p1['name']} (100%)")
     else:
-        st.markdown(f"""
-        **목표 컬러:** {get_color_box_by_hex(targ_hex, 25)} &nbsp; | &nbsp; **오차율(Delta E):** {best_mix['delta_e']:.2f}
-        """, unsafe_allow_html=True)
-        
+        st.markdown(f"**목표 컬러:** {get_color_box_by_hex(targ_hex, 25)} &nbsp; | &nbsp; **오차율(Delta E):** {best_mix['delta_e']:.2f}", unsafe_allow_html=True)
         html_table = f"""
         <table style="width:100%; text-align:center; border-collapse: collapse; background-color:#ffffff; color:#111111;">
             <tr style="background-color:#f8f9fa; border-bottom: 2px solid #ddd;">
@@ -292,7 +349,9 @@ if current_file and target_file:
         """
         st.markdown(html_table, unsafe_allow_html=True)
 
-    # 💡 3분할 화면으로 원본, 주입 타겟, 예상 결과를 나란히 배치
+    # ----------------------------------------
+    # ✨ 분석 5&6: 3분할 결과물 시뮬레이션
+    # ----------------------------------------
     st.markdown('<div class="step-header">✨ 분석 5&6. 초기 상태 ➔ 주입 타겟 ➔ 예상 결과 시뮬레이션</div>', unsafe_allow_html=True)
     c1, c2, c3 = st.columns(3)
     
@@ -304,4 +363,4 @@ if current_file and target_file:
     final_result_img = apply_color_overlay(base_img, full_lip_mask, mix_hex, alpha=0.45)
     c3.image(final_result_img, caption="[예상] 시술 후 예상 결과", use_container_width=True)
     
-    st.caption("※ 시각화된 예상 이미지는 픽셀 블렌딩을 통한 시뮬레이션이며, 실제 고객의 피부 조직 두께 및 탈각 과정에 따라 최종 발색은 다를 수 있습니다.")
+    st.caption("※ 시각화된 예상 이미지는 픽셀 블렌딩을 통한 시뮬레이션이며, 실제 피부 두께 및 탈각 과정에 따라 최종 발색은 다를 수 있습니다.")
